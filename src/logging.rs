@@ -50,14 +50,3 @@ pub fn error(msg: impl AsRef<str>) {
     eprintln!("{} {}", p.red(&p.bold("✖")), msg.as_ref());
 }
 
-pub fn kv_listing(header_path: &str, items: &[(String, String)]) {
-    if items.is_empty() {
-        println!("# {} (no variables)", header_path);
-        return;
-    }
-    println!("# {}", header_path);
-    let width = items.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
-    for (k, v) in items {
-        println!("{:width$} = {}", k, v, width = width);
-    }
-}

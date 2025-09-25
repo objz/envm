@@ -1,24 +1,20 @@
+use clap::{Parser, Subcommand, ValueEnum};
+use color_eyre::eyre::Result;
 use std::path::PathBuf;
 
-use clap::{ArgAction, Parser, Subcommand};
-use color_eyre::eyre::Result;
-
-use crate::env::{EnvMap, load_env_map, save_env_map, validate_key};
+use crate::env::{
+    EnvMap, default_env_file, load_env_map, quote_fish, quote_posix, save_env_map, validate_key,
+};
 use crate::logging as log;
-use crate::reload::reload;
-use crate::scope::Scope;
 use std::io::{self, Write};
+
 #[derive(Parser, Debug)]
 #[command(
     version,
-    about = "Manage global environment variables (systemd environment.d)"
+    about = "Manage global environment variables (portable, no systemd)"
 )]
 struct Cli {
-    /// Use system scope (/etc/environment.d) instead of user scope (~/.config/environment.d)
-    #[arg(long, action = ArgAction::SetTrue)]
-    system: bool,
-
-    /// Path of the managed environment file (defaults: 90-genv.conf in the appropriate environment.d)
+    /// Override the managed env file (default: ~/.config/genv/env)
     #[arg(long)]
     file: Option<PathBuf>,
 
@@ -28,7 +24,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum CommandKind {
-    /// Add a new variable 
+    /// Add a new variable
     Add { key: String, value: String },
 
     /// Edit an existing variable
@@ -39,23 +35,34 @@ enum CommandKind {
 
     /// List variables managed by this file
     List,
+
+    /// Print exports for the current shell. Use with: eval "$(genv export)"
+    Export {
+        /// Force a shell style 
+        #[arg(long, value_enum)]
+        shell: Option<ShellKind>,
+    },
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum ShellKind {
+    Posix,
+    Fish,
 }
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    let scope = if cli.system {
-        Scope::System
-    } else {
-        Scope::User
-    };
-
-    let env_file = crate::env::default_env_file(scope, cli.file.as_deref())?;
+    let env_file = default_env_file(cli.file.as_deref())?;
 
     let mut map: EnvMap = match load_env_map(&env_file) {
         Ok(m) => m,
-        Err(err) if err.to_string().contains("No such file") => EnvMap::default(),
-        Err(err) if err.to_string().contains("not found") => EnvMap::default(),
-        Err(err) if err.to_string().contains("open") => EnvMap::default(),
+        Err(err)
+            if err.to_string().contains("No such file")
+                || err.to_string().contains("not found")
+                || err.to_string().contains("open") =>
+        {
+            EnvMap::default()
+        }
         Err(e) => return Err(e),
     };
 
@@ -68,7 +75,7 @@ pub fn run() -> Result<()> {
                     return Ok(());
                 }
                 print!(
-                    "variable {} already exists with value '{}'. Overwrite? [y/N]: ",
+                    "variable {} exists with value '{}'. Overwrite? [y/N]: ",
                     key, existing
                 );
                 io::stdout().flush().unwrap();
@@ -81,33 +88,29 @@ pub fn run() -> Result<()> {
             }
             map.insert(key.clone(), value.clone());
             save_env_map(&env_file, &map)?;
-            reload(&scope, &[key.as_str()])?;
-            log::success(format!("added variable {}={}", key, value));
+            log::success(format!("added {}={}", key, value));
         }
 
         CommandKind::Edit { key, value } => {
             validate_key(key)?;
             let Some(existing) = map.get(key) else {
                 log::error(format!("key {} does not exist", key));
-                return Ok(()); 
+                return Ok(());
             };
-
             if existing == value {
                 log::warn(format!("variable {} already has that value", key));
                 return Ok(());
             }
             map.insert(key.clone(), value.clone());
             save_env_map(&env_file, &map)?;
-            reload(&scope, &[key.as_str()])?;
-            log::success(format!("edited variable {}={}", key, value));
+            log::success(format!("edited {}={}", key, value));
         }
 
         CommandKind::Remove { key } => {
             validate_key(key)?;
             if map.remove(key).is_some() {
                 save_env_map(&env_file, &map)?;
-                reload(&scope, &[] as &[&str])?;
-                log::success(format!("removed variable {}", key));
+                log::success(format!("removed {}", key));
             } else {
                 log::warn(format!("key {} is not present", key));
             }
@@ -117,9 +120,51 @@ pub fn run() -> Result<()> {
             let mut items: Vec<(String, String)> =
                 map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             items.sort_by(|a, b| a.0.cmp(&b.0));
-            log::kv_listing(&env_file.display().to_string(), &items);
+            if items.is_empty() {
+                println!("# {} (no variables)", env_file.display());
+            } else {
+                println!("# {}", env_file.display());
+                let width = items.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+                for (k, v) in items {
+                    println!("{:width$} = {}", k, v, width = width);
+                }
+            }
+        }
+
+        CommandKind::Export { shell } => {
+            let flavor = shell.unwrap_or_else(detect_shell);
+            let mut keys: Vec<_> = map.keys().cloned().collect();
+            keys.sort();
+            match flavor {
+                ShellKind::Posix => {
+                    for k in keys {
+                        let v = map.get(&k).unwrap();
+                        println!("export {}={}", k, quote_posix(v));
+                    }
+                }
+                ShellKind::Fish => {
+                    for k in keys {
+                        let v = map.get(&k).unwrap();
+                        println!("set -gx {} {}", k, quote_fish(v));
+                    }
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+fn detect_shell() -> ShellKind {
+    if std::env::var_os("FISH_VERSION").is_some() {
+        return ShellKind::Fish;
+    }
+    if let Some(shell) = std::env::var_os("SHELL") {
+        if let Some(s) = shell.to_str() {
+            if s.ends_with("/fish") {
+                return ShellKind::Fish;
+            }
+        }
+    }
+    ShellKind::Posix
 }
