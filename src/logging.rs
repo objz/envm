@@ -49,4 +49,3 @@ pub fn error(msg: impl AsRef<str>) {
     let p = palette();
     eprintln!("{} {}", p.red(&p.bold("✖")), msg.as_ref());
 }
-

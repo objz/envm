@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::Result;
 use std::path::PathBuf;
 
+use crate::completions;
 use crate::env::{
     EnvMap, default_env_file, load_env_map, quote_fish, quote_posix, save_env_map, validate_key,
 };
@@ -38,15 +39,29 @@ enum CommandKind {
 
     /// Print exports for the current shell. Use with: eval "$(genv export)"
     Export {
-        /// Force a shell style 
+        /// Force a shell style
         #[arg(long, value_enum)]
         shell: Option<ShellKind>,
+    },
+
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: CompletionShell,
     },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum ShellKind {
     Posix,
+    Fish,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum CompletionShell {
+    Bash,
+    Zsh,
     Fish,
 }
 
@@ -68,7 +83,10 @@ pub fn run() -> Result<()> {
 
     match &cli.cmd {
         CommandKind::Add { key, value } => {
-            validate_key(key)?;
+            if let Err(e) = validate_key(key) {
+                log::error(e.to_string());
+                return Ok(());
+            }
             if let Some(existing) = map.get(key) {
                 if existing == value {
                     log::warn(format!("variable {} already set to the same value", key));
@@ -92,7 +110,10 @@ pub fn run() -> Result<()> {
         }
 
         CommandKind::Edit { key, value } => {
-            validate_key(key)?;
+            if let Err(e) = validate_key(key) {
+                log::error(e.to_string());
+                return Ok(());
+            }
             let Some(existing) = map.get(key) else {
                 log::error(format!("key {} does not exist", key));
                 return Ok(());
@@ -107,7 +128,10 @@ pub fn run() -> Result<()> {
         }
 
         CommandKind::Remove { key } => {
-            validate_key(key)?;
+            if let Err(e) = validate_key(key) {
+                log::error(e.to_string());
+                return Ok(());
+            }
             if map.remove(key).is_some() {
                 save_env_map(&env_file, &map)?;
                 log::success(format!("removed {}", key));
@@ -150,6 +174,15 @@ pub fn run() -> Result<()> {
                 }
             }
         }
+
+        CommandKind::Completions { shell } => {
+            let mut stdout = io::stdout();
+            match shell {
+                CompletionShell::Bash => completions::generate_bash(&mut stdout)?,
+                CompletionShell::Zsh => completions::generate_zsh(&mut stdout)?,
+                CompletionShell::Fish => completions::generate_fish(&mut stdout)?,
+            }
+        }
     }
 
     Ok(())
@@ -159,12 +192,11 @@ fn detect_shell() -> ShellKind {
     if std::env::var_os("FISH_VERSION").is_some() {
         return ShellKind::Fish;
     }
-    if let Some(shell) = std::env::var_os("SHELL") {
-        if let Some(s) = shell.to_str() {
-            if s.ends_with("/fish") {
-                return ShellKind::Fish;
-            }
-        }
+    if let Some(shell) = std::env::var_os("SHELL")
+        && let Some(s) = shell.to_str()
+        && s.ends_with("/fish")
+    {
+        return ShellKind::Fish;
     }
     ShellKind::Posix
 }
