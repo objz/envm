@@ -1,2 +1,5 @@
 target/
 repomix-output.xml
+pkg/*/*.tar.gz
+pkg/*/LICENSE-*
+pkg/*/README-*
